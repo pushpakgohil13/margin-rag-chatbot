@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-PIPELINE_VERSION = "2.0"
+PIPELINE_VERSION = "3.0"
 APP_DIR = Path(__file__).parent
 CACHE_DIR = Path(tempfile.gettempdir()) / "margin_cache"
 NOT_FOUND = "I couldn't find that in your documents."
@@ -65,7 +65,7 @@ PROFILES = {
         "routing": False, "neighbours": 0, "vision": True, "footnotes": True,
         "strategy": [
             ("Parsing", "Three layers per page: the text layer, a vision-model description of every chart, table and icon call-out on the page image, and each endnote as its own item."),
-            ("Why vision", "A rule-based table extractor misread this report: it treated chart bars as tables and dropped rows of the power table. Reading the page image recovers the numbers with their labels."),
+            ("Why vision", "Rule-based table extractors often misread designed reports. On the iMac report one treated chart bars as tables and dropped rows of the power table. Reading the page image recovers numbers together with their labels."),
             ("Chunking", "Smaller chunks (700 characters) because facts are short and dense. Chart and table descriptions stay whole."),
             ("Footnote linking", "When a retrieved passage carries a footnote marker (like STAR.18), that endnote is added to the context so its conditions are not lost."),
         ],
@@ -80,6 +80,7 @@ USE_CASES = {
     "gpo": {
         "label": "Use case 1: GPO annual report",
         "file": "GPO-Anual-report.pdf", "title": "GPO 2018 Annual Report", "profile": "narrative",
+        "match": ["government publishing office 2018 annual report", "gpo 2018 annual report"],
         "about": "82 pages of narrative text with facts written into sentences. The baseline case.",
         "starters": [
             "How many depository libraries did GPO staff visit in FY 2018?",
@@ -98,6 +99,7 @@ USE_CASES = {
     "gep": {
         "label": "Use case 2: World Bank economic report",
         "file": "GEP-Jun-2026.pdf", "title": "Global Economic Prospects, June 2026", "profile": "structured",
+        "match": ["global economic prospects"],
         "about": "200 pages in chapters, regions, boxes and a statistical annex. Structure matters.",
         "starters": [
             "What is the growth outlook for South Asia in this report?",
@@ -116,6 +118,7 @@ USE_CASES = {
     "imac": {
         "label": "Use case 3: Apple iMac environmental report",
         "file": "iMac_PER_Oct2024.pdf", "title": "iMac Product Environmental Report", "profile": "visual",
+        "match": ["imac product environmental report"],
         "about": "12 short pages where facts sit in charts, tables, icon call-outs and footnotes.",
         "starters": [
             "How much less energy does iMac use compared to the ENERGY STAR requirement?",
@@ -442,6 +445,116 @@ def describe_pages(name, title, data, llm, progress=None):
     return chunks
 
 
+
+# ---------------------------------------------------------------------------
+# Automatic document-type detection
+# ---------------------------------------------------------------------------
+
+CHAPTERISH = re.compile(r"^\s*(ch\.?|chapter|part|section)\s*\d+\b", re.I)
+
+
+def pdf_signals(data):
+    """Measure the things that tell document shapes apart."""
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    n = len(reader.pages)
+    step = max(1, n // 50)  # sample up to ~50 pages so long reports are measured in a few seconds
+    texts = [reader.pages[i].extract_text() or "" for i in range(0, n, step)]
+    titles = []
+    try:
+        def walk(items):
+            for it in items:
+                walk(it) if isinstance(it, list) else titles.append(clean_title(it.title))
+        walk(reader.outline)
+    except Exception:
+        pass
+    lines = [l.strip() for t in texts for l in t.split("\n") if l.strip()]
+    joined = "\n".join(texts)
+    paths = images = sampled = 0
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_raw
+        pdf = pdfium.PdfDocument(data)
+        for i in range(0, n, max(1, n // 25)):
+            sampled += 1
+            for obj in pdf[i].get_objects(max_depth=2):
+                if obj.type == pdfium_raw.FPDF_PAGEOBJ_PATH:
+                    paths += 1
+                elif obj.type == pdfium_raw.FPDF_PAGEOBJ_IMAGE:
+                    images += 1
+        pdf.close()
+    except Exception:
+        pass
+    meta_title = ""
+    try:
+        meta_title = (reader.metadata.title or "") if reader.metadata else ""
+    except Exception:
+        pass
+    return {
+        "pages": n,
+        "chars_per_page": sum(map(len, texts)) / max(len(texts), 1),
+        "chapter_pages": step * sum(1 for t in texts if re.search(r"(?im)^\s*(chapter|part)\s+\d+\b", t[:300])),
+        "chapter_bookmarks": sum(1 for t in titles if CHAPTERISH.match(t)),
+        "bookmarks": len(titles),
+        "short_lines": sum(1 for l in lines if len(l) < 25) / max(len(lines), 1),
+        "notes_section": bool(re.search(r"(?im)^\s*(endnotes|footnotes|notes)\s*$", joined)),
+        "units_per_page": len(re.findall(r"\d+(?:\.\d+)?\s?(?:%|percent|kg|kWh|W\b|g\b|mm\b)", joined)) / max(len(texts), 1),
+        "graphics_per_page": (paths + 20 * images) / max(sampled, 1),
+        "meta_title": meta_title,
+        "first_page": (reader.pages[0].extract_text() or "")[:600] if n else "",
+    }
+
+
+def detect_profile(name, data):
+    """Work out which of the three strategies fits a file. Returns profile, reasons and a display title."""
+    ext = name.lower().rsplit(".", 1)[-1]
+    stem = re.sub(r"[_\-]+", " ", name.rsplit(".", 1)[0]).strip()
+    if ext != "pdf":
+        text = data.decode("utf-8", errors="ignore") if ext in ("md", "txt") else ""
+        headings = 0
+        if ext == "md":
+            headings = len(re.findall(r"(?m)^#{1,3} ", text))
+        elif ext == "docx":
+            import docx
+            d = docx.Document(io.BytesIO(data))
+            headings = sum(1 for p in d.paragraphs if (p.style.name or "").lower().startswith("heading"))
+            text = "\n".join(p.text for p in d.paragraphs)
+        if headings >= 8 and len(text) > 30000:
+            return {"profile": "structured", "title": stem, "known": None,
+                    "reasons": [f"{headings} headings", f"{len(text):,} characters"]}
+        return {"profile": "narrative", "title": stem, "known": None,
+                "reasons": [f"{headings} headings" if headings else "continuous text", f"{len(text):,} characters"]}
+
+    s = pdf_signals(data)
+    title = clean_title(s["meta_title"]) or stem
+    haystack = (s["meta_title"] + " " + s["first_page"]).lower()
+    known = next((k for k, uc in USE_CASES.items() if any(m in haystack for m in uc.get("match", []))), None)
+
+    visual_hits = []
+    if s["short_lines"] >= 0.27:
+        visual_hits.append(f"{s['short_lines']:.0%} of lines are short labels")
+    if s["notes_section"]:
+        visual_hits.append("has an endnotes section")
+    if s["units_per_page"] >= 4:
+        visual_hits.append(f"{s['units_per_page']:.0f} measurements per page")
+    if s["graphics_per_page"] >= 35:
+        visual_hits.append("chart-heavy pages")
+
+    if s["chapter_pages"] >= 2 or s["chapter_bookmarks"] >= 3 or s["pages"] >= 150:
+        reasons = [f"{s['pages']} pages"]
+        if s["chapter_pages"] or s["chapter_bookmarks"]:
+            reasons.append(f"{max(s['chapter_pages'], s['chapter_bookmarks'])} chapter headings")
+        if s["bookmarks"]:
+            reasons.append(f"{s['bookmarks']} bookmarks")
+        profile = "structured"
+    elif s["pages"] <= 40 and len(visual_hits) >= 2:
+        profile, reasons = "visual", [f"{s['pages']} pages"] + visual_hits
+    else:
+        profile = "narrative"
+        reasons = [f"{s['pages']} pages", f"{s['chars_per_page']:,.0f} characters per page", "no chapter structure"]
+    return {"profile": profile, "title": title, "known": known, "reasons": reasons, "signals": s}
+
+
 CHUNKERS = {"narrative": chunk_narrative, "structured": chunk_structured, "visual": chunk_visual}
 
 # ---------------------------------------------------------------------------
@@ -517,72 +630,48 @@ def normalise_rows(m):
 _MEMORY = {}
 
 
-def kb_key(files, profile, size, overlap, embed_model, vision):
-    h = hashlib.sha256()
-    for name, data in files:
-        h.update(name.encode())
-        h.update(hashlib.sha256(data).digest())
-    h.update(json.dumps([PIPELINE_VERSION, profile, size, overlap, embed_model, vision]).encode())
-    return h.hexdigest()[:20]
-
-
-def prebuilt_paths(name_hint):
-    return [APP_DIR / f"margin_index_{name_hint}.pkl.gz", APP_DIR / "indexes" / f"margin_index_{name_hint}.pkl.gz",
-            CACHE_DIR / f"{name_hint}.pkl.gz"]
-
-
 def serialise(kb):
     keep = {k: v for k, v in kb.items() if k not in ("bm25",)}
     return gzip.compress(pickle.dumps(keep))
 
 
-def load_saved(name_hint, key):
-    for path in prebuilt_paths(name_hint):
-        try:
-            if path.exists():
-                kb = pickle.loads(gzip.decompress(path.read_bytes()))
-                if kb.get("key") == key:
-                    kb["loaded_from"] = "saved index file" if path.parent != CACHE_DIR else "server cache"
-                    return kb
-        except Exception:
-            continue
-    return None
-
-
-def build_kb(files, title, profile_name, api_key, chat_model, size=None, overlap=None,
-             name_hint="custom", progress=None, use_vision=None):
-    """files: list of (filename, bytes). Returns a knowledge base dict."""
-    profile = PROFILES[profile_name]
-    size = size or profile["chunk_size"]
-    overlap = overlap if overlap is not None else profile["chunk_overlap"]
-    vision = profile["vision"] if use_vision is None else use_vision
-    embed_model = embedding_model_name(api_key)
-    key = kb_key(files, profile_name, size, overlap, embed_model, vision)
+def build_kb(entries, api_key, chat_model, progress=None):
+    """entries: list of dicts with name, data, profile, title. Each file is handled with its own strategy."""
     say = progress or (lambda *_: None)
+    embed_model = embedding_model_name(api_key)
+    h = hashlib.sha256(json.dumps([PIPELINE_VERSION, embed_model]).encode())
+    for e in entries:
+        h.update(e["name"].encode() + e["profile"].encode() + hashlib.sha256(e["data"]).digest())
+    key = h.hexdigest()[:20]
 
     if key in _MEMORY:
         return _MEMORY[key]
-    kb = load_saved(name_hint, key)
-    if kb:
-        kb["bm25"] = make_bm25(kb["chunks"])
-        _MEMORY[key] = kb
-        return kb
+    cached = CACHE_DIR / f"{key}.pkl.gz"
+    if cached.exists():
+        try:
+            kb = pickle.loads(gzip.decompress(cached.read_bytes()))
+            kb["bm25"], kb["loaded_from"] = make_bm25(kb["chunks"]), "server cache"
+            _MEMORY[key] = kb
+            return kb
+        except Exception:
+            pass
 
-    timings, t = {}, time.time()
-    say("Parsing and chunking", 0.02)
-    chunks = []
-    for name, data in files:
-        chunks.extend(CHUNKERS[profile_name](name, title, data, size, overlap))
+    timings, chunks = {}, []
+    t = time.time()
+    for n, e in enumerate(entries, 1):
+        p = PROFILES[e["profile"]]
+        say("parse", f"Reading {e['name']}", 0.02, file=e["name"])
+        part = CHUNKERS[e["profile"]](e["name"], e["title"], e["data"], p["chunk_size"], p["chunk_overlap"])
+        if p["vision"] and e["name"].lower().endswith(".pdf"):
+            vision_llm = make_llm(api_key, chat_model, temperature=0.0, max_tokens=2000)
+            part += describe_pages(e["name"], e["title"], e["data"], vision_llm,
+                                   progress=lambda msg, f: say("vision", msg, 0.05 + 0.25 * f, file=e["name"]))
+        for c in part:
+            c["profile"], c["title"] = e["profile"], e["title"]
+        chunks.extend(part)
     timings["parse_chunk"] = time.time() - t
-    if vision:
-        t = time.time()
-        vision_llm = make_llm(api_key, chat_model, temperature=0.0, max_tokens=2000)
-        for name, data in files:
-            if name.lower().endswith(".pdf"):
-                chunks.extend(describe_pages(name, title, data, vision_llm, progress=say))
-        timings["vision"] = time.time() - t
     if not chunks:
-        raise ValueError("No readable text was found in these files.")
+        raise ValueError("No readable text was found. Scanned PDFs (photos of pages) aren't supported yet.")
     for i, c in enumerate(chunks):
         c["id"] = i
 
@@ -591,26 +680,51 @@ def build_kb(files, title, profile_name, api_key, chat_model, size=None, overlap
     texts = [f"{c['header']}\n{c['text']}" for c in chunks]
     vectors, batch = [], 32
     for start in range(0, len(texts), batch):
-        say(f"Embedding chunks {start + 1}–{min(start + batch, len(texts))} of {len(texts)}",
-            0.1 + 0.9 * start / len(texts))
+        frac = 0.3 + 0.7 * start / len(texts)
+        say("embed", f"Turning passages {start + 1}–{min(start + batch, len(texts))} of {len(texts)} into vectors", frac)
         part = texts[start:start + batch]
         vectors.extend(call_with_retry(lambda: emb.embed_documents(part),
-                                       wait=lambda s: say(f"Gemini rate limit reached, resuming in {s}s",
-                                                          0.1 + 0.9 * start / len(texts))))
+                                       wait=lambda s: say("wait", f"Gemini asked me to slow down. Back in {s}s", frac)))
     timings["embed"] = time.time() - t
 
-    kb = {"key": key, "title": title, "profile": profile_name, "chunks": chunks,
-          "vectors": normalise_rows(vectors), "embed_model": embed_model, "chunk_size": size,
-          "chunk_overlap": overlap, "vision": vision, "files": [n for n, _ in files],
-          "timings": timings, "loaded_from": "built just now", "name_hint": name_hint}
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (CACHE_DIR / f"{name_hint}.pkl.gz").write_bytes(serialise(kb))
-    except Exception:
-        pass
+    kb = {"key": key, "title": " + ".join(e["title"] for e in entries), "profiles": sorted({e["profile"] for e in entries}),
+          "chunks": chunks, "vectors": normalise_rows(vectors), "embed_model": embed_model,
+          "files": [{"name": e["name"], "profile": e["profile"], "title": e["title"]} for e in entries],
+          "timings": timings, "loaded_from": "built just now", "suggestions": []}
+    save_kb(kb)
     kb["bm25"] = make_bm25(chunks)
     _MEMORY[key] = kb
     return kb
+
+
+def save_kb(kb):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / f"{kb['key']}.pkl.gz").write_bytes(serialise(kb))
+    except Exception:
+        pass
+
+
+SUGGEST_PROMPT = """Here are passages from a document. Write 3 short, specific questions a reader could ask
+that these passages clearly answer. Vary them (a number, a definition or rule, a summary).
+Return only the 3 questions, one per line, without numbering.
+
+{passages}"""
+
+
+def suggest_questions(kb, llm):
+    """Starter questions for a document we haven't seen before."""
+    pool = [c for c in kb["chunks"] if c["kind"] in ("text", "visual") and len(c["text"]) > 300]
+    if not pool:
+        return []
+    picks = [pool[int(i)] for i in np.linspace(0, len(pool) - 1, min(8, len(pool)))]
+    passages = "\n\n".join(f"({c['header']})\n{c['text'][:500]}" for c in picks)
+    try:
+        reply = get_text(call_with_retry(lambda: llm.invoke(SUGGEST_PROMPT.format(passages=passages))))
+        qs = [re.sub(r"^[\-\d.)\s]+", "", l).strip() for l in reply.split("\n")]
+        return [q for q in qs if q.endswith("?")][:3]
+    except Exception:
+        return []
 
 
 def make_bm25(chunks):
@@ -621,6 +735,10 @@ def make_bm25(chunks):
 # ---------------------------------------------------------------------------
 # Retrieval: routing -> hybrid search -> fusion -> reranking -> context assembly
 # ---------------------------------------------------------------------------
+
+
+def has_profile(kb, name):
+    return name in kb.get("profiles", [kb.get("profile")])
 
 
 def section_aliases(kb):
@@ -652,12 +770,12 @@ def section_aliases(kb):
 
 def route(kb, query):
     """Return the sections a question explicitly asks about (empty list = search everything)."""
-    if not PROFILES[kb["profile"]]["routing"]:
+    if not has_profile(kb, "structured"):
         return []
     q = " " + re.sub(r"[^\w.\- ]", " ", query.lower()) + " "
     hits = []
     for name, (field, terms) in section_aliases(kb).items():
-        if name.lower() in ("front matter",) or name.lower().startswith("page "):
+        if name.lower() in ("front matter", "endnotes") or name.lower().startswith("page "):
             continue
         if any(re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", q) for t in terms if len(t) >= 3):
             hits.append((field, name))
@@ -718,15 +836,15 @@ def search(kb, query, api_key, k=6, use_routing=True, use_hybrid=True, use_reran
 
     # 6. context assembly: neighbours and linked footnotes, within a budget
     results = [{"id": c, "reason": "retrieved", "score": float(sims[c])} for c in chosen]
-    profile = PROFILES[kb["profile"]]
     budget, used = 16000, sum(len(chunks[c]["text"]) for c in chosen)
     have = set(chosen)
     if use_expand:
         extras = []
         for r in results:
             c = chunks[r["id"]]
+            profile = PROFILES[c.get("profile", "narrative")]
             for note in c.get("footnote_refs", []) if profile["footnotes"] else []:
-                fid = next((x["id"] for x in chunks if x.get("note") == note), None)
+                fid = next((x["id"] for x in chunks if x.get("note") == note and x.get("source") == c.get("source")), None)
                 if fid is not None and fid not in have:
                     extras.append({"id": fid, "reason": f"endnote {note}, referenced by a retrieved passage",
                                    "score": float(sims[fid])})

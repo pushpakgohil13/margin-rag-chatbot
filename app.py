@@ -1,57 +1,110 @@
 """
-Margin — ask your documents.  (Advanced RAG edition)
+Margin — ask your documents.
 
-The interface. The pipeline itself lives in rag_engine.py:
-    Document -> Parsing -> Chunking -> Embedding -> Retrieval -> Reranking -> Context -> LLM -> Evaluation
+Upload any PDF, Word, Markdown or text file. Margin detects what kind of document it is
+(plain narrative, long structured report, or visual with charts/tables/footnotes) and picks
+the matching RAG strategy. Pip, the mascot, narrates what's happening.
+
+Pipeline (rag_engine.py):
+Document -> Parsing -> Chunking -> Embedding -> Retrieval -> Reranking -> Context -> LLM -> Evaluation
 """
 
+import hashlib
 import html
 import os
+import random
 import re
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+import mascot
 import rag_engine as rag
 
-APP_DIR = Path(__file__).parent
 CHAT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
-HANDBOOK_NAME = "lumen_design_handbook.md"
-HANDBOOK_TEXT = '# Lumen Design System — Team Handbook\n\nThis handbook explains how the product design team builds, reviews and ships work using the Lumen design system. It is a fictional sample document used to demonstrate the Margin RAG chatbot.\n\n# About Lumen\n\nLumen is the shared design system used by all product squads. It contains foundations (color, type, spacing, motion), a component library in Figma, and matching React components maintained by the front-end platform team. The design system team has four people: one lead designer, two product designers and one design engineer. Lumen releases a new version on the first Monday of every month.\n\n# Color tokens\n\nNever use raw hex values in a design file. Always use a semantic color token such as color.text.primary or color.surface.raised. Brand colors are only used for marketing surfaces and must not appear inside the product UI. Every color token has a light-mode and a dark-mode value, and designers must check both modes before handoff.\n\n# Accessibility standards\n\nAll product screens must meet WCAG 2.2 level AA. Body text needs a contrast ratio of at least 4.5:1 against its background. Large text (24px and above, or 18.5px bold) and UI icons need at least 3:1. Interactive targets must be at least 44 by 44 pixels on touch devices. Every flow must be fully usable with a keyboard, and focus states must always be visible. Color must never be the only way information is shown; pair it with an icon, label or pattern.\n\n# Typography\n\nThe product typeface is Inter for UI text and JetBrains Mono for code. The type scale has seven steps: 12, 14, 16, 20, 24, 32 and 40 pixels. Body text is 16px with a line height of 1.5. Do not use more than three type sizes on a single screen.\n\n# Spacing and layout\n\nLumen uses a 4px base spacing unit. All padding and margins must be multiples of 4px, with the most common values being 8, 16, 24 and 32. Layouts use a 12-column grid on desktop with 24px gutters, an 8-column grid on tablet and a 4-column grid on mobile with 16px gutters. Maximum content width is 1280px.\n\n# Icons\n\nIcons come in three sizes: 16px, 20px and 24px. Use the 20px size by default. All icons are outlined with a 1.5px stroke. Custom icons must be submitted to the design system team for review before they are used in production.\n\n# Design critique\n\nDesign crits happen every Wednesday from 3:00 to 4:00 pm. Anyone can bring work at any fidelity. Book a slot in the #design-crit channel by Tuesday at 6 pm. Each slot is 20 minutes: 5 minutes of context, 10 minutes of feedback and 5 minutes to agree on next steps. Feedback should be framed around the user problem and the brief, not personal taste.\n\n# Requesting a new component\n\nIf no existing component fits, fill in the component request form in Notion. Include the problem, at least two real screens where it will be used, and a link to any research. The design system team reviews requests every Friday. The standard turnaround for a new component, from approval to release in Figma and code, is 10 business days. Urgent requests need sign-off from the head of design.\n\n# Figma file conventions\n\nName files using the pattern Squad / Feature / Stage, for example Payments / Refund flow / Explorations. Every file must have a cover page with the owner, status and last-updated date. Status labels are Exploring, In review, Ready for dev and Shipped. Detach components only as a last resort, and leave a comment explaining why.\n\n# Handoff to engineering\n\nA design is ready for development only when it passes the handoff checklist: all states are designed (empty, loading, error, success), both light and dark modes are checked, copy has been reviewed by the content designer, accessibility annotations are added, and the file status is set to Ready for dev. Designers attend the sprint kickoff for any feature they hand off.\n\n# Deprecating components\n\nWhen a component is replaced, it is marked as deprecated in Figma and code. Deprecated components are kept for two monthly releases and then removed. Squads get a migration guide and a reminder in the #lumen-updates channel one week before removal.\n\n# Research and testing\n\nEvery major feature needs at least five usability test sessions before release. Research notes and recordings are stored in the Research Hub in Dovetail. Participants are paid a 50 dollar voucher for a 45 minute session. Personal data from research must be deleted after 12 months.\n\n# Tools and access\n\nThe team uses Figma for design, Notion for documentation, Dovetail for research and Linear for tracking work. New designers get Figma editor access on their first day and Dovetail access after completing the research privacy training.\n'
+TYPE_SHORT = {"narrative": "Narrative", "structured": "Structured", "visual": "Visual"}
+TYPE_LINE = {
+    "narrative": "This reads like a straight narrative report. I'll go page by page and keep every fact next to its sentence.",
+    "structured": "A long, structured one! I'll map every chapter and section first, so I never mix them up.",
+    "visual": "Lots of charts, tables and footnotes here. I'll look at every page image so no number can hide from me.",
+}
+KIND = {"text": "text", "table": "table", "visual": "chart/table from page image", "footnote": "endnote"}
 
-SOURCES = {**{k: v["label"] for k, v in rag.USE_CASES.items()},
-           "handbook": "Sample: Lumen design handbook", "upload": "Upload my own files"}
+st.set_page_config(page_title="Margin · Ask your documents", page_icon="🖍️", layout="centered",
+                   initial_sidebar_state="collapsed")
 
 # ---------------------------------------------------------------------------
-# Page setup
+# Visual design: deep ink background with a soft violet-to-sky aurora
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Margin · Ask your documents", page_icon="🖍️", layout="wide")
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap');
-.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button p {
-  font-family: 'Figtree', system-ui, sans-serif; }
-[data-testid="stIconMaterial"], .material-symbols-rounded { font-family: 'Material Symbols Rounded' !important; }
-.stApp h1, .stApp h2, .stApp h3 { font-family: 'Newsreader', Georgia, serif; letter-spacing: -0.01em; }
-.margin-title { font-family: 'Newsreader', Georgia, serif !important; font-size: 2.6rem !important;
-  font-weight: 600 !important; line-height: 1.1 !important; margin: 0 !important; letter-spacing: -0.01em; }
-.margin-sub { opacity: .72; margin: .35rem 0 1rem 0; max-width: 64ch; }
-.margin-source { border-left: 3px solid #4A63D9; padding: .55rem .9rem; margin: .5rem 0 .8rem 0;
-  background: rgba(74, 99, 217, .06); border-radius: 0 6px 6px 0; line-height: 1.55; white-space: pre-wrap; }
-.margin-source.cited { border-left-color: #E2B100; background: rgba(255, 214, 0, .10); }
-.margin-source.extra { border-left-style: dashed; }
-.margin-source .meta { font-size: .82rem; opacity: .78; margin-bottom: .3rem; white-space: normal; }
-.margin-source mark { background: rgba(255, 214, 0, .45); color: inherit; padding: 0 .1em; border-radius: 2px; }
-.margin-pill { display: inline-block; font-size: .78rem; padding: .1rem .55rem; border-radius: 999px;
-  border: 1px solid rgba(128,128,128,.35); margin: 0 .35rem .35rem 0; }
-.margin-step { font-family: 'Newsreader', Georgia, serif; font-size: 1.25rem; font-weight: 600; margin: 1.1rem 0 .2rem 0; }
-</style>
-""", unsafe_allow_html=True)
+st.markdown("<style>" + """
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+:root{--ink:#0E1222;--panel:rgba(255,255,255,.045);--line:rgba(255,255,255,.09);--text:#E7E9F3;--muted:#9AA3B8;
+  --violet:#7C5CFF;--sky:#38BDF8;--grad:linear-gradient(135deg,#7C5CFF 0%,#4F8BFF 55%,#38BDF8 100%)}
+.stApp{background:
+  radial-gradient(900px 480px at 8% -8%,rgba(124,92,255,.30),transparent 60%),
+  radial-gradient(760px 420px at 100% 0%,rgba(56,189,248,.20),transparent 60%),
+  radial-gradient(700px 500px at 50% 115%,rgba(244,114,182,.10),transparent 60%),var(--ink);
+  background-attachment:fixed;color:var(--text)}
+.stApp,.stApp p,.stApp li,.stApp label,.stApp input,.stApp textarea,.stApp button p,.stApp span{
+  font-family:'Plus Jakarta Sans',system-ui,sans-serif}
+[data-testid="stIconMaterial"],.material-symbols-rounded{font-family:'Material Symbols Rounded'!important}
+[data-testid="stHeader"]{background:transparent}
+.block-container{padding-top:2.4rem;padding-bottom:9rem;max-width:860px}
+[data-testid="stSidebar"]{background:rgba(17,21,40,.82);border-right:1px solid var(--line)}
+.m-word{font-weight:700;font-size:2.5rem;letter-spacing:-.03em;line-height:1;margin:0;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;display:inline-block}
+.m-tag{color:var(--muted);margin:.6rem 0 1rem 0;font-size:1rem;max-width:56ch}
+.m-hero-title{font-size:1.9rem;font-weight:700;letter-spacing:-.025em;line-height:1.2;margin:.2rem 0 .5rem 0;color:var(--text)}
+.m-card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:1rem 1.1rem;margin:.6rem 0}
+.m-card h4{margin:0 0 .25rem 0;font-size:1rem;font-weight:600;color:var(--text)}
+.m-card p{margin:.15rem 0;color:var(--muted);font-size:.88rem}
+.m-badge{display:inline-block;font-size:.75rem;font-weight:600;padding:.18rem .65rem;border-radius:999px;color:#0E1222;margin-right:.4rem}
+.m-badge.narrative{background:linear-gradient(135deg,#C4B5FD,#A78BFA)}
+.m-badge.structured{background:linear-gradient(135deg,#7DD3FC,#5EEAD4)}
+.m-badge.visual{background:linear-gradient(135deg,#FDBA74,#F9A8D4)}
+.m-chip{display:inline-block;font-size:.78rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;
+  padding:.12rem .6rem;margin:.15rem .3rem .15rem 0;background:rgba(255,255,255,.02)}
+.m-bar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.2rem 0 .4rem 0}
+.m-step{font-weight:600;font-size:1.05rem;margin:1.2rem 0 .25rem 0;color:var(--text)}
+.stButton>button,.stDownloadButton>button{border-radius:12px;border:1px solid var(--line);background:var(--panel);
+  color:var(--text);transition:border-color .2s,transform .1s}
+.stButton>button:hover{border-color:rgba(124,92,255,.6);color:#fff}
+.stButton>button:active{transform:scale(.98)}
+.stButton>button[kind="primary"]{background:var(--grad);border:0;color:#fff;font-weight:600;
+  box-shadow:0 8px 24px rgba(79,139,255,.28)}
+.stButton>button[kind="primary"]:hover{filter:brightness(1.08)}
+.stButton>button:focus-visible{outline:2px solid #A78BFA;outline-offset:2px}
+[data-testid="stFileUploaderDropzone"]{background:rgba(124,92,255,.06);border:1.5px dashed rgba(167,139,250,.45);border-radius:18px;
+  padding:1.6rem 1.2rem;min-height:110px;transition:border-color .2s,background .2s}
+[data-testid="stFileUploaderDropzone"]:hover{border-color:rgba(167,139,250,.85);background:rgba(124,92,255,.10)}
+.st-key-starters .stButton>button{justify-content:flex-start;text-align:left;padding:.7rem 1rem}
+.stButton>button p{white-space:normal;text-align:inherit}
+[data-testid^="stChatMessageAvatar"]{background:var(--grad)!important;color:#fff!important;border-radius:10px}
+[data-testid="stChatMessageAvatarUser"]{background:rgba(255,255,255,.10)!important}
+.stApp p.m-label{color:var(--muted);font-size:.8rem!important;margin:.15rem 0 .1rem .15rem;line-height:1.3}
+[data-testid="stChatMessage"]{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:.9rem 1rem}
+[data-testid="stChatInput"]{border-radius:16px}
+[data-testid="stChatInput"] textarea{font-family:'Plus Jakarta Sans',system-ui,sans-serif}
+[data-testid="stExpander"] details{background:var(--panel);border:1px solid var(--line);border-radius:14px}
+.stTabs [data-baseweb="tab-list"]{gap:.35rem;border-bottom:1px solid var(--line)}
+.stTabs [data-baseweb="tab"]{padding:.4rem .9rem;border-radius:10px 10px 0 0}
+.stTabs [data-baseweb="tab-highlight"]{background:var(--grad);height:3px;border-radius:3px}
+[data-testid="stProgress"] div[role="progressbar"] div div{background:var(--grad)!important}
+.m-src{border-left:3px solid #6D7BFF;padding:.6rem .9rem;margin:.5rem 0 .8rem 0;background:rgba(109,123,255,.07);
+  border-radius:0 12px 12px 0;line-height:1.55;white-space:pre-wrap;color:var(--text)}
+.m-src.cited{border-left-color:#FDBA74;background:rgba(253,186,116,.08)}
+.m-src.extra{border-left-style:dashed}
+.m-src .meta{font-size:.8rem;color:var(--muted);margin-bottom:.3rem;white-space:normal}
+.m-src mark{background:rgba(253,186,116,.35);color:inherit;padding:0 .1em;border-radius:3px}
+""" + mascot.CSS + "</style>", unsafe_allow_html=True)
 
+
+# ---------------------------------------------------------------------------
+# Secrets and helpers
+# ---------------------------------------------------------------------------
 
 def read_secret(name):
     try:
@@ -63,8 +116,10 @@ def read_secret(name):
 
 password = read_secret("APP_PASSWORD")
 if password and not st.session_state.get("unlocked"):
-    st.markdown('<div class="margin-title">Margin</div>', unsafe_allow_html=True)
-    entered = st.text_input("Enter the access password to continue", type="password")
+    st.markdown('<div class="m-word">Margin</div>', unsafe_allow_html=True)
+    st.markdown(mascot.render("idle", "This Margin is private. Enter the access password to continue.", "hero"),
+                unsafe_allow_html=True)
+    entered = st.text_input("Access password", type="password")
     if entered == password:
         st.session_state.unlocked = True
         st.rerun()
@@ -73,17 +128,21 @@ if password and not st.session_state.get("unlocked"):
     st.stop()
 
 API_KEY = read_secret("GOOGLE_API_KEY")
+ss = st.session_state
+for k, v in {"messages": [], "last_trace": None, "entries": None, "kb_key": None, "editing": False,
+             "uploader_n": 0, "pip": None}.items():
+    ss.setdefault(k, v)
 
 
 def friendly_error(err):
     msg = str(err)
     if rag.is_rate_limit(err):
-        return "The Gemini free-tier limit was reached. Wait a minute and try again."
+        return "Gemini's free-tier limit was reached. Wait a minute and try again."
     if "API key" in msg or "API_KEY" in msg or "401" in msg or "403" in msg:
         return "Gemini rejected the API key. Check GOOGLE_API_KEY in the app's secrets."
     if "404" in msg or "not found" in msg.lower():
-        return "That Gemini model isn't available for this key. Pick another model in Answer settings."
-    return f"Something went wrong while talking to Gemini: {msg[:300]}"
+        return "That Gemini model isn't available for this key. Pick another model in Settings."
+    return f"Something went wrong while talking to Gemini: {msg[:240]}"
 
 
 STOP = set("a an and are as at be by can do does for from has have how i in is it its me my of on or should "
@@ -98,147 +157,225 @@ def highlight(text, query):
     return safe
 
 
-KIND = {"text": "text", "table": "table", "visual": "chart/table from page image", "footnote": "endnote"}
+@st.cache_data(show_spinner=False, max_entries=20)
+def detect(name, data):
+    d = rag.detect_profile(name, data)
+    d.pop("signals", None)
+    return d
 
 
-def find_bundled(filename):
-    for p in (APP_DIR / filename, APP_DIR / "docs" / filename):
-        if p.exists():
-            return p.read_bytes()
-    return None
+def short(title, n=46):
+    return title if len(title) <= n else title[: n - 1].rstrip() + "…"
+
+
+def where(chunk, preposition=False):
+    page = chunk.get("page")
+    sec = chunk.get("section") or ""
+    if chunk.get("kind") == "footnote":
+        text = f"endnote {chunk.get('note')}"
+        return ("in " if preposition else "") + text
+    if sec and not sec.lower().startswith("page") and sec != chunk.get("chapter"):
+        text = f"{sec}, page {page}" if page else sec
+        return ("in " if preposition else "") + text
+    text = f"page {page}" if page else short(chunk.get("title", "the document"), 30)
+    return ("on " if preposition else "") + text
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar: settings only
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("### Your documents")
-    source = st.radio("Knowledge source", list(SOURCES), format_func=SOURCES.get, label_visibility="collapsed")
-
-    uploads, upload_profile = [], "narrative"
-    if source == "upload":
-        uploads = st.file_uploader("PDF, Word, Markdown or text files", type=["pdf", "docx", "txt", "md"],
-                                   accept_multiple_files=True)
-        upload_profile = st.selectbox("What kind of document is it?", list(rag.PROFILES),
-                                      format_func=lambda p: rag.PROFILES[p]["label"],
-                                      help="Picks the parsing and chunking strategy.")
+    st.markdown("### Settings")
+    model = st.selectbox("Chat model", CHAT_MODELS + ["Other…"],
+                         help="Flash-lite is faster and cheaper. Flash gives fuller answers.")
+    if model == "Other…":
+        model = st.text_input("Model name", value="gemini-3.5-flash")
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.1)
+    k = st.slider("Sources per answer", 2, 10, 6)
+    st.markdown("**Pipeline steps**")
+    use_hybrid = st.toggle("Hybrid search (meaning + exact words)", value=True)
+    use_routing = st.toggle("Section-aware routing", value=True, help="Used for long, structured documents.")
+    use_rerank = st.toggle("Rerank with Gemini", value=True)
+    use_expand = st.toggle("Add neighbouring passages and footnotes", value=True)
+    use_rewrite = st.toggle("Understand follow-up questions", value=True)
     st.caption("Files are sent to Google Gemini to be processed. Don't upload confidential or client data.")
 
-    profile_name = rag.USE_CASES[source]["profile"] if source in rag.USE_CASES else (
-        upload_profile if source == "upload" else "narrative")
-    profile = rag.PROFILES[profile_name]
-
-    with st.expander("Answer settings"):
-        model = st.selectbox("Chat model", CHAT_MODELS + ["Other…"],
-                             help="Flash-lite is faster and cheaper. Flash gives fuller answers.")
-        if model == "Other…":
-            model = st.text_input("Model name", value="gemini-3.5-flash")
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.1)
-        k = st.slider("Sources per answer (top-k)", 2, 10, profile["k"])
-
-    with st.expander("Pipeline steps"):
-        use_hybrid = st.toggle("Hybrid search (meaning + exact words)", value=True)
-        use_routing = st.toggle("Section-aware routing", value=profile["routing"],
-                                disabled=not profile["routing"],
-                                help="Only for long, structured documents.")
-        use_rerank = st.toggle("Rerank with Gemini", value=True, help="One extra Gemini call per question.")
-        use_expand = st.toggle("Add neighbouring passages and footnotes", value=True)
-        use_rewrite = st.toggle("Understand follow-up questions", value=True)
-
-    size = overlap = None
-    if source in ("upload", "handbook"):
-        with st.expander("Chunking settings"):
-            size = st.slider("Chunk size (characters)", 300, 2000, profile["chunk_size"], 100)
-            overlap = st.slider("Overlap (characters)", 0, 400, profile["chunk_overlap"], 25)
-
-    if st.button("Clear conversation", width="stretch"):
-        st.session_state.messages, st.session_state.last_trace = [], None
-        st.rerun()
-
-settings = dict(k=k, use_routing=use_routing, use_hybrid=use_hybrid, use_rerank=use_rerank,
-                use_expand=use_expand)
+settings = dict(k=k, use_routing=use_routing, use_hybrid=use_hybrid, use_rerank=use_rerank, use_expand=use_expand)
 
 # ---------------------------------------------------------------------------
-# Header, document loading, index building
+# Header
 # ---------------------------------------------------------------------------
 
-st.markdown('<div class="margin-title">Margin</div>', unsafe_allow_html=True)
-st.markdown('<p class="margin-sub">Ask questions about your documents. Every answer points to the passage it '
-            'came from, and says so when the answer isn\'t there.</p>', unsafe_allow_html=True)
+st.markdown('<div class="m-word">Margin</div><p class="m-tag">Ask questions about your documents. Every answer '
+            'points to the passage it came from.</p>', unsafe_allow_html=True)
 
 if not API_KEY:
-    st.error("Add your Gemini API key to start. In Streamlit Cloud open the app's Settings, then Secrets, "
-             'and add the line GOOGLE_API_KEY = "your-key". Get a free key at aistudio.google.com.')
+    st.markdown(mascot.render("confused", "I need a Gemini API key before I can read anything. Add GOOGLE_API_KEY "
+                              "under Settings → Secrets in Streamlit Cloud.", "hero"), unsafe_allow_html=True)
     st.stop()
 
-if source in rag.USE_CASES:
-    uc = rag.USE_CASES[source]
-    data = find_bundled(uc["file"])
-    if data is None:
-        st.warning(f"**{uc['file']}** isn't in your GitHub repository yet. Upload it next to app.py to make this "
-                   "use case load automatically, or add it here for this session.")
-        tmp = st.file_uploader(f"Add {uc['file']}", type=["pdf"], key=f"missing_{source}")
-        if not tmp:
-            st.stop()
-        data = tmp.getvalue()
-    files, title, name_hint = [(uc["file"], data)], uc["title"], source
-elif source == "handbook":
-    files, title, name_hint = [(HANDBOOK_NAME, HANDBOOK_TEXT.encode())], "Lumen design handbook", "handbook"
-else:
-    if not uploads:
-        st.info("Upload one or more files in the sidebar and choose what kind of document they are.")
+kb = rag._MEMORY.get(ss.kb_key) if ss.kb_key else None
+if kb is None and ss.entries and not ss.editing:
+    # The server restarted or memory was cleared: rebuild quietly (usually instant from the disk cache).
+    try:
+        kb = rag.build_kb(ss.entries, API_KEY, model)
+        ss.kb_key = kb["key"]
+    except Exception:
+        ss.entries = None
+
+# ---------------------------------------------------------------------------
+# Setup: upload, detect, read
+# ---------------------------------------------------------------------------
+
+if kb is None or ss.editing:
+    pip_slot = st.empty()
+    st.markdown('<div class="m-hero-title">Drop a document. Pip works out what kind it is.</div>',
+                unsafe_allow_html=True)
+    files = st.file_uploader("PDF, Word, Markdown or text", type=["pdf", "docx", "md", "txt"],
+                             accept_multiple_files=True, key=f"uploader_{ss.uploader_n}",
+                             label_visibility="collapsed")
+
+    if not files:
+        pip_slot.markdown(mascot.render("greet", "Hi, I'm Pip! Drop a report, handbook or spec. I'll check whether "
+                                        "it's plain text, a long structured report, or full of charts and tables, "
+                                        "and read it the right way.", "hero"), unsafe_allow_html=True)
+        if ss.editing and kb is not None and st.button("Back to the chat"):
+            ss.editing = False
+            st.rerun()
         st.stop()
-    files, title, name_hint = [(f.name, f.getvalue()) for f in uploads], ", ".join(f.name for f in uploads), "custom"
 
-doc_key = (source, tuple(n for n, _ in files), profile_name, size, overlap)
-if st.session_state.get("doc_key") != doc_key:
-    st.session_state.doc_key = doc_key
-    st.session_state.messages, st.session_state.last_trace = [], None
+    pending = []
+    with st.spinner("Pip is looking at the pages…"):
+        for f in files:
+            data = f.getvalue()
+            d = detect(f.name, data)
+            pending.append({"name": f.name, "data": data, **d})
 
-status = st.empty()
-bar = st.empty()
+    for i, e in enumerate(pending):
+        badge = f'<span class="m-badge {e["profile"]}">{TYPE_SHORT[e["profile"]]}</span>'
+        known = ""
+        if e.get("known"):
+            known = f'<span class="m-chip">Hands-on {rag.USE_CASES[e["known"]]["label"].split(":")[0].lower()}</span>'
+        chips = "".join(f'<span class="m-chip">{html.escape(r)}</span>' for r in e["reasons"])
+        st.markdown(f'<div class="m-card"><h4>{html.escape(short(e["title"], 70))}</h4>'
+                    f'<p>{badge}{known}{html.escape(e["name"])}</p><div>{chips}</div></div>', unsafe_allow_html=True)
+        st.markdown('<p class="m-label">Not quite right? Change the type</p>', unsafe_allow_html=True)
+        choice = st.selectbox("Document type", list(rag.PROFILES), index=list(rag.PROFILES).index(e["profile"]),
+                              format_func=lambda p: rag.PROFILES[p]["label"],
+                              key=f"type_{hashlib.md5(e['data']).hexdigest()}", label_visibility="collapsed")
+        e["profile"] = choice
 
+    if len(pending) == 1:
+        line = TYPE_LINE[pending[0]["profile"]]
+    else:
+        counts = pd.Series([TYPE_SHORT[e["profile"]].lower() for e in pending]).value_counts()
+        line = (f"{len(pending)} documents: " + ", ".join(f"{v} {t}" for t, v in counts.items())
+                + ". I'll use the right strategy for each one.")
+    pages = 0
+    for e in pending:
+        m = re.match(r"(\d+) pages", e["reasons"][0] if e["reasons"] else "")
+        pages += int(m.group(1)) if m else 0
+    if pages > 100:
+        line += " It's a big read, so give me a few minutes."
+    pip_slot.markdown(mascot.render("idle", line + " Change the type below if I got it wrong.", "hero"),
+                      unsafe_allow_html=True)
 
-def progress(message, fraction):
-    status.caption(message)
-    bar.progress(min(max(fraction, 0.0), 1.0))
+    cols = st.columns([1, 1] if ss.editing and kb is not None else [1])
+    go = cols[0].button("Read documents", type="primary", width="stretch")
+    if ss.editing and kb is not None and cols[1].button("Cancel", width="stretch"):
+        ss.editing = False
+        st.rerun()
 
+    if go:
+        bar = st.progress(0.0)
+        pip_slot.empty()
+        dock = st.empty()  # Pip moves to the corner so progress stays visible wherever the page is scrolled
+        moods = {"parse": "reading", "vision": "reading", "embed": "thinking", "wait": "confused"}
 
-try:
-    kb = rag.build_kb(files, title, profile_name, API_KEY, model, size=size, overlap=overlap,
-                      name_hint=name_hint, progress=progress)
-except Exception as e:
-    status.empty(); bar.empty()
-    st.error(str(e) if isinstance(e, ValueError) else friendly_error(e))
+        doing = {"narrative": "Going page by page and keeping each fact with its sentence.",
+                 "structured": "Mapping its chapters, regions and boxes.",
+                 "visual": "Reading the text first, then I'll study each page image."}
+        by_name = {e["name"]: e["profile"] for e in pending}
+
+        def progress(stage, message, fraction, file=None):
+            if stage == "parse" and file:
+                message = f"Reading {short(file, 32)}. {doing[by_name.get(file, 'narrative')]}"
+            dock.markdown(mascot.render(moods.get(stage, "reading"), message, "dock"), unsafe_allow_html=True)
+            bar.progress(min(max(fraction, 0.0), 1.0))
+
+        entries = [{k2: e[k2] for k2 in ("name", "data", "profile", "title", "known")} for e in pending]
+        try:
+            kb = rag.build_kb(entries, API_KEY, model, progress=progress)
+        except Exception as err:
+            bar.empty()
+            dock.empty()
+            pip_slot.markdown(mascot.render("confused", str(err) if isinstance(err, ValueError) else friendly_error(err),
+                                            "hero"), unsafe_allow_html=True)
+            st.stop()
+        if not kb.get("suggestions") and not any(e.get("known") for e in entries):
+            progress("embed", "Almost done. Thinking of good first questions…", 0.98)
+            kb["suggestions"] = rag.suggest_questions(kb, rag.make_llm(API_KEY, model, 0.4))
+            rag.save_kb(kb)
+        ss.entries, ss.kb_key, ss.editing = entries, kb["key"], False
+        ss.messages, ss.last_trace = [], None
+        n_visual = sum(1 for c in kb["chunks"] if c["kind"] == "visual")
+        extra = f", including {n_visual} pages of charts and tables" if n_visual else ""
+        ss.pip = ("happy", f"All read: {len(kb['chunks'])} passages{extra}. Ask me anything!", True)
+        st.rerun()
     st.stop()
-status.empty(); bar.empty()
 
-kinds = pd.Series([c["kind"] for c in kb["chunks"]]).value_counts().to_dict()
-pills = [f"{len(kb['chunks'])} chunks"] + [f"{v} {KIND[k2]}" for k2, v in kinds.items() if k2 != "text"]
-pills += [profile["label"], f"index {kb['loaded_from']}"]
-st.markdown("".join(f'<span class="margin-pill">{html.escape(p)}</span>' for p in pills), unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Ready: documents loaded
+# ---------------------------------------------------------------------------
 
-st.session_state.setdefault("messages", [])
-st.session_state.setdefault("last_trace", None)
+pip_slot = st.empty()
 
 
-def llm_for(temp=None):
-    return rag.make_llm(API_KEY, model, temperature if temp is None else temp)
+def pip(mood, message, autohide=False):
+    ss.pip = (mood, message, autohide)
+    pip_slot.markdown(mascot.render(mood, message, "dock", autohide), unsafe_allow_html=True)
 
 
-def run_pipeline(question, history, opts, stream_to=None):
-    """Rewrite -> retrieve -> rerank -> context -> generate. Returns answer, results, trace."""
-    llm, times = llm_for(), {}
+if ss.pip:
+    pip(*ss.pip)
+else:
+    pip("idle", f"Ask me anything about {short(kb['title'], 40)}.", True)
+
+bar_html = "".join(f'<span class="m-badge {f["profile"]}">{TYPE_SHORT[f["profile"]]}</span>'
+                   f'<span class="m-chip">{html.escape(short(f["title"], 50))}</span>' for f in kb["files"])
+c1, c2 = st.columns([5, 1.4], vertical_alignment="center")
+c1.markdown(f'<div class="m-bar">{bar_html}<span class="m-chip">{len(kb["chunks"])} passages</span></div>',
+            unsafe_allow_html=True)
+if c2.button("Change documents", width="stretch"):
+    ss.editing, ss.uploader_n, ss.pip = True, ss.uploader_n + 1, None
+    st.rerun()
+
+known = [e["known"] for e in (ss.entries or []) if e.get("known")]
+
+
+def run_pipeline(question, history, opts, stream_to=None, narrate=False):
+    llm, llm0, times = rag.make_llm(API_KEY, model, temperature), rag.make_llm(API_KEY, model, 0.0), {}
+    if narrate:
+        pip("thinking", random.choice(["Hmm, let me look…", f"Searching {len(kb['chunks'])} passages…",
+                                       "Flipping through the pages…"]))
     t = time.time()
-    query = rag.rewrite_query(llm_for(0.0), question, history) if (use_rewrite and history) else question
+    query = rag.rewrite_query(llm0, question, history) if (use_rewrite and history) else question
     times["rewrite"] = time.time() - t
     t = time.time()
-    results, trace = rag.search(kb, query, API_KEY, llm=llm_for(0.0), **opts)
+    results, trace = rag.search(kb, query, API_KEY, llm=llm0, **opts)
     times["retrieve"] = time.time() - t
+    if narrate:
+        if trace["routes"]:
+            pip("reading", f"Checking only {', '.join(short(r, 34) for r in trace['routes'])}, so nothing gets mixed up.")
+        else:
+            pip("talking", "Found some good passages. Writing the answer…")
     messages = rag.build_messages(kb, question, results, history)
     t = time.time()
     if stream_to is not None:
+        if narrate and trace["routes"]:
+            pip("talking", "Writing the answer…")
+
         def gen():
             for chunk in llm.stream(messages):
                 text = rag.get_text(chunk)
@@ -248,24 +385,22 @@ def run_pipeline(question, history, opts, stream_to=None):
     else:
         answer = rag.get_text(rag.call_with_retry(lambda: llm.invoke(messages)))
     times["generate"] = time.time() - t
-    trace.update(question=question, times=times, prompt="\n\n".join(f"[{m.type}]\n{m.content}" for m in messages),
-                 results=results, answer=answer)
+    trace.update(question=question, times=times, results=results, answer=answer,
+                 prompt="\n\n".join(f"[{m.type}]\n{m.content}" for m in messages))
     return answer, results, trace
 
 
 def render_sources(results, query, answer):
     cited = {int(n) for n in re.findall(r"\[(\d+)\]", answer or "")}
     n_cited = sum(1 for i in range(1, len(results) + 1) if i in cited)
-    with st.expander(f"Sources · {n_cited} cited of {len(results)} in context"):
+    with st.expander(f"Sources · {n_cited} cited of {len(results)}"):
         for i, r in enumerate(results, 1):
             c = kb["chunks"][r["id"]]
-            classes = "margin-source" + (" cited" if i in cited else "") + (" extra" if r["reason"] != "retrieved" else "")
+            cls = "m-src" + (" cited" if i in cited else "") + (" extra" if r["reason"] != "retrieved" else "")
             extra = "" if r["reason"] == "retrieved" else f" · added: {r['reason']}"
-            st.markdown(
-                f'<div class="{classes}"><div class="meta"><b>[{i}]</b> {html.escape(c["header"])} · '
-                f'{KIND[c["kind"]]} · match {r["score"]:.2f}{html.escape(extra)}'
-                f'{" · used in answer" if i in cited else ""}</div>{highlight(c["text"], query)}</div>',
-                unsafe_allow_html=True)
+            st.markdown(f'<div class="{cls}"><div class="meta"><b>[{i}]</b> {html.escape(c["header"])} · '
+                        f'{KIND[c["kind"]]} · match {r["score"]:.2f}{html.escape(extra)}</div>'
+                        f'{highlight(c["text"], query)}</div>', unsafe_allow_html=True)
 
 
 tab_chat, tab_how, tab_test = st.tabs(["Chat", "How it works", "Test it"])
@@ -275,83 +410,91 @@ tab_chat, tab_how, tab_test = st.tabs(["Chat", "How it works", "Test it"])
 # ---------------------------------------------------------------------------
 
 with tab_chat:
-    if source in rag.USE_CASES:
-        st.caption(rag.USE_CASES[source]["about"])
-    starters = rag.USE_CASES[source]["starters"] if source in rag.USE_CASES else (
-        ["How long does a new component request take?", "What contrast ratio does body text need?"]
-        if source == "handbook" else ["Summarise the main topics in these documents."])
-    if not st.session_state.messages:
-        cols = st.columns(len(starters))
-        for col, q in zip(cols, starters):
-            if col.button(q, width="stretch"):
-                st.session_state.pending = q
-                st.rerun()
+    starters = []
+    for key in known:
+        starters += rag.USE_CASES[key]["starters"]
+    starters = (starters or kb.get("suggestions") or ["Summarise the main topics in this document."])[:3]
+    if not ss.messages:
+        st.caption("Try asking")
+        with st.container(key="starters"):
+            for i, q in enumerate(starters):
+                if st.button(q, width="stretch", key=f"starter_{i}"):
+                    ss.pending = q
+                    st.rerun()
 
-    for m in st.session_state.messages:
+    for m in ss.messages:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
             if m.get("results"):
                 render_sources(m["results"], m.get("query", ""), m["content"])
 
-    question = st.chat_input("Ask about your documents") or st.session_state.pop("pending", None)
+    question = st.chat_input("Ask about your documents") or ss.pop("pending", None)
     if question:
-        history = list(st.session_state.messages)
+        history = list(ss.messages)
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
             try:
-                answer, results, trace = run_pipeline(question, history, settings, stream_to=st)
+                answer, results, trace = run_pipeline(question, history, settings, stream_to=st, narrate=True)
             except Exception as e:
-                st.error(friendly_error(e))
+                pip("confused", friendly_error(e))
                 st.stop()
             render_sources(results, trace["query"], answer)
-        st.session_state.messages += [{"role": "user", "content": question},
-                                       {"role": "assistant", "content": answer, "results": results,
-                                        "query": trace["query"]}]
-        st.session_state.last_trace = trace
+        ss.messages += [{"role": "user", "content": question},
+                        {"role": "assistant", "content": answer, "results": results, "query": trace["query"]}]
+        ss.last_trace = trace
+        if rag.NOT_FOUND.lower()[:20] in answer.lower():
+            pip("confused", "I couldn't find that in your documents, so I won't guess. Try asking it another way?")
+        else:
+            cited = [int(n) for n in re.findall(r"\[(\d+)\]", answer)]
+            top = results[cited[0] - 1] if cited and cited[0] <= len(results) else (results[0] if results else None)
+            spot = f" {where(kb['chunks'][top['id']], preposition=True)}" if top else ""
+            pip("happy", f"Found it{spot}. The exact passages are under my answer.", True)
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # How it works
 # ---------------------------------------------------------------------------
 
 with tab_how:
-    st.caption(f"Strategy for this document: {profile['label'].lower()}. Each stage, using the index loaded now.")
-    for name, text in profile["strategy"]:
-        st.markdown(f"**{name}.** {text}")
+    st.caption("What Pip did with each document, and how your last question was answered.")
+    for f in kb["files"]:
+        p = rag.PROFILES[f["profile"]]
+        steps = "".join(f"<p><b style='color:var(--text)'>{html.escape(n)}.</b> {html.escape(t)}</p>"
+                        for n, t in p["strategy"])
+        st.markdown(f'<div class="m-card"><h4><span class="m-badge {f["profile"]}">{TYPE_SHORT[f["profile"]]}</span>'
+                    f'{html.escape(short(f["title"], 60))}</h4>{steps}</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="margin-step">1. Parse and chunk</div>', unsafe_allow_html=True)
+    st.markdown('<div class="m-step">1. Parse and chunk</div>', unsafe_allow_html=True)
+    kinds = pd.Series([c["kind"] for c in kb["chunks"]]).value_counts().to_dict()
     sizes = [len(c["text"]) for c in kb["chunks"]]
-    st.write(f"**{len(kb['chunks'])}** chunks from {len(kb['files'])} file(s), target size {kb['chunk_size']} "
-             f"characters with {kb['chunk_overlap']} overlap (average {int(np.mean(sizes))}).")
-    if profile_name == "structured":
+    st.write(f"**{len(kb['chunks'])}** passages, averaging {int(np.mean(sizes))} characters: "
+             + ", ".join(f"{v} {KIND[k2]}" for k2, v in kinds.items()) + ".")
+    structured = [c for c in kb["chunks"] if c.get("profile") == "structured"]
+    if structured:
         rows = {}
-        for c in kb["chunks"]:
+        for c in structured:
             key = (c.get("chapter", ""), c.get("section", ""))
-            r = rows.setdefault(key, {"Chapter": key[0], "Section": key[1], "Pages": [], "Chunks": 0})
-            r["Pages"].append(c.get("page", 0)); r["Chunks"] += 1
-        table = [{**r, "Pages": f"{min(r['Pages'])}–{max(r['Pages'])}"} for r in rows.values()]
-        st.caption("Document map detected during parsing")
-        st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch")
-    if kinds:
-        st.caption("Chunk types: " + ", ".join(f"{v} {KIND[k2]}" for k2, v in kinds.items()))
-    kind_filter = st.selectbox("Browse chunks of type", ["all"] + list(kinds), format_func=lambda x: KIND.get(x, x))
+            r = rows.setdefault(key, {"Chapter": key[0], "Section": key[1], "Pages": [], "Passages": 0})
+            r["Pages"].append(c.get("page") or 0)
+            r["Passages"] += 1
+        st.caption("Document map detected while parsing")
+        st.dataframe(pd.DataFrame([{**r, "Pages": f"{min(r['Pages'])}–{max(r['Pages'])}"} for r in rows.values()]),
+                     hide_index=True, width="stretch")
+    kind_filter = st.selectbox("Browse passages of type", ["all"] + list(kinds), format_func=lambda x: KIND.get(x, x))
     pool = [c for c in kb["chunks"] if kind_filter == "all" or c["kind"] == kind_filter]
-    ix = st.number_input(f"Chunk (1–{len(pool)})", 1, len(pool), 1) - 1
+    ix = st.number_input(f"Passage (1–{len(pool)})", 1, len(pool), 1) - 1
     chosen = pool[ix]
-    st.markdown(f'<div class="margin-source"><div class="meta">{html.escape(chosen["header"])} · '
-                f'{KIND[chosen["kind"]]}</div>{html.escape(chosen["text"])}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="m-src"><div class="meta">{html.escape(chosen["header"])} · {KIND[chosen["kind"]]}</div>'
+                f'{html.escape(chosen["text"])}</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="margin-step">2. Embed and store</div>', unsafe_allow_html=True)
-    st.write(f"Each chunk, with its header, became **{kb['vectors'].shape[1]}** numbers using `{kb['embed_model']}`. "
-             "Vectors are kept in an in-memory NumPy store, and a BM25 keyword index is built alongside. "
-             "First eight numbers of this chunk:")
+    st.markdown('<div class="m-step">2. Embed and store</div>', unsafe_allow_html=True)
+    st.write(f"Each passage and its header became **{kb['vectors'].shape[1]}** numbers with `{kb['embed_model']}`, "
+             "stored in an in-memory vector store alongside a BM25 keyword index. This passage starts with:")
     st.code(", ".join(f"{x:.4f}" for x in kb["vectors"][chosen["id"]][:8]) + ", …")
-    st.download_button("Download this index", rag.serialise(kb), file_name=f"margin_index_{kb['name_hint']}.pkl.gz",
-                       help="Upload this file to your GitHub repository next to app.py and this document will "
-                            "load instantly, with no embedding calls.")
 
-    trace = st.session_state.last_trace
-    st.markdown('<div class="margin-step">3. Retrieve, rerank and assemble context</div>', unsafe_allow_html=True)
+    trace = ss.last_trace
+    st.markdown('<div class="m-step">3. Retrieve, rerank and assemble context</div>', unsafe_allow_html=True)
     if not trace:
         st.info("Ask a question in the Chat tab to see how it was answered.")
     else:
@@ -362,19 +505,21 @@ with tab_how:
             st.write("Search limited to: **" + "**, **".join(trace["routes"]) + "**")
 
         def label(cid):
-            return kb["chunks"][cid]["header"].split(" › ")[-1] if " › " in kb["chunks"][cid]["header"] else kb["chunks"][cid]["header"]
+            return short(where(kb["chunks"][cid]), 40)
 
-        c1, c2, c3 = st.columns(3)
-        c1.caption("Meaning search (top 5)"); c1.write("\n".join(f"- {label(i)}" for i in trace["dense"][:5]) or "—")
-        c2.caption("Keyword search (top 5)"); c2.write("\n".join(f"- {label(i)}" for i in trace["sparse"][:5]) or "off")
-        c3.caption("After fusion" + (" and reranking" if trace["reranked"] else ""))
-        c3.write("\n".join(f"- {label(r['id'])}" for r in trace["results"] if r["reason"] == "retrieved"))
+        a, b, c = st.columns(3)
+        a.caption("Meaning search")
+        a.write("\n".join(f"- {label(i)}" for i in trace["dense"][:5]) or "—")
+        b.caption("Keyword search")
+        b.write("\n".join(f"- {label(i)}" for i in trace["sparse"][:5]) or "off")
+        c.caption("After fusion" + (" + reranking" if trace["reranked"] else ""))
+        c.write("\n".join(f"- {label(r['id'])}" for r in trace["results"] if r["reason"] == "retrieved"))
         extras = [r for r in trace["results"] if r["reason"] != "retrieved"]
         if extras:
             st.write("Added for context: " + "; ".join(f"{label(r['id'])} ({r['reason']})" for r in extras))
-        st.caption(f"Context sent to Gemini: {trace['context_chars']:,} characters. Retrieval took "
-                   f"{trace['times']['retrieve']:.1f}s, the answer {trace['times']['generate']:.1f}s.")
-        st.markdown('<div class="margin-step">4. Generate</div>', unsafe_allow_html=True)
+        st.caption(f"Context sent to Gemini: {trace['context_chars']:,} characters · retrieval "
+                   f"{trace['times']['retrieve']:.1f}s · answer {trace['times']['generate']:.1f}s")
+        st.markdown('<div class="m-step">4. Generate</div>', unsafe_allow_html=True)
         with st.expander("See the exact prompt sent to Gemini"):
             st.code(trace["prompt"], language=None)
 
@@ -386,32 +531,37 @@ COLS = ["Question", "Must contain", "Expected section", "Should say it doesn't k
 BASIC = dict(k=4, use_routing=False, use_hybrid=False, use_rerank=False, use_expand=False)
 
 with tab_test:
+    defaults = [t for key in known for t in rag.USE_CASES[key]["tests"]]
+    if defaults:
+        st.caption("Pip recognised the hands-on task document and loaded its sample questions with expected answers.")
+    else:
+        defaults = [(q, "", "", False) for q in kb.get("suggestions", [])] + [
+            ("What is the capital of France?", "", "", True)]
+        st.caption("Add the facts each answer must contain to turn these into real checks.")
     st.caption("Must contain: separate required items with ; and alternatives with |  (e.g. 346; 45; 50). "
-               "Expected section is optional and checks that retrieval found the right part of the document.")
-    defaults = rag.USE_CASES[source]["tests"] if source in rag.USE_CASES else (
-        rag.SAMPLE_TESTS_HANDBOOK if source == "handbook" else [("What is this document about?", "", "", False)])
+               "Expected section is optional and checks retrieval found the right part of the document.")
     cases = st.data_editor(pd.DataFrame(defaults, columns=COLS), num_rows="dynamic", width="stretch",
-                           hide_index=True, key=f"tests_{source}")
+                           hide_index=True, key=f"tests_{kb['key']}")
     mode = st.radio("Pipeline to test", ["Advanced (current settings)", "Compare with basic RAG"], horizontal=True,
                     help="Basic = meaning search only, top 4, no routing, reranking or context expansion.")
-
     if st.button("Run tests", type="primary"):
         variants = [("Advanced", settings)] + ([("Basic", BASIC)] if mode.startswith("Compare") else [])
-        rows, todo = [], [r for _, r in cases.iterrows() if str(r["Question"] or "").strip()]
+        todo = [r for _, r in cases.iterrows() if str(r["Question"] or "").strip()]
+        rows, total, done = [], len(todo) * len(variants), 0
         bar_t = st.progress(0.0, text="Running tests…")
-        total, done = len(todo) * len(variants), 0
+        pip("thinking", f"Running {total} tests. I'll mark my own homework.")
         for vname, opts in variants:
             for r in todo:
                 q = str(r["Question"]).strip()
                 try:
                     t = time.time()
                     answer, results, _ = run_pipeline(q, [], opts)
-                    ok, why = rag.check_answer(answer, str(r["Must contain"] or ""), bool(r["Should say it doesn't know"]))
+                    ok, why = rag.check_answer(answer, str(r["Must contain"] or ""),
+                                               bool(r["Should say it doesn't know"]))
                     ret = rag.check_retrieval(kb, results, str(r["Expected section"] or ""))
-                    rows.append({"Pipeline": vname, "Result": "✅ Pass" if ok else "❌ Fail", "Question": q,
-                                 "Why": why, "Right section": "—" if ret is None else ("✅" if ret else "❌"),
-                                 "Top source": kb["chunks"][results[0]["id"]]["header"].split(" · ")[0][-60:] + " · " +
-                                               kb["chunks"][results[0]["id"]]["header"].split(" · ")[-1],
+                    rows.append({"Pipeline": vname, "Result": "✅ Pass" if ok else "❌ Fail", "Question": q, "Why": why,
+                                 "Right section": "—" if ret is None else ("✅" if ret else "❌"),
+                                 "Top source": where(kb["chunks"][results[0]["id"]]) if results else "",
                                  "Seconds": round(time.time() - t, 1), "Answer": answer})
                 except Exception as e:
                     rows.append({"Pipeline": vname, "Result": "⚠️ Error", "Question": q, "Why": friendly_error(e)})
@@ -419,10 +569,18 @@ with tab_test:
                 bar_t.progress(done / total, text=f"Ran {done} of {total}")
         bar_t.empty()
         df = pd.DataFrame(rows)
-        cols = st.columns(len(variants))
-        for col, (vname, _) in zip(cols, variants):
+        mcols = st.columns(len(variants))
+        scores = {}
+        for col, (vname, _) in zip(mcols, variants):
             part = df[df["Pipeline"] == vname]
-            col.metric(f"{vname} pipeline", f"{(part['Result'] == '✅ Pass').sum()} of {len(part)} passed")
+            scores[vname] = (int((part["Result"] == "✅ Pass").sum()), len(part))
+            col.metric(f"{vname} pipeline", f"{scores[vname][0]} of {scores[vname][1]} passed")
         st.dataframe(df, hide_index=True, width="stretch")
-        st.caption("Fails show where to improve: a ❌ in Right section is a retrieval problem; a ✅ section with a "
-                   "wrong answer is a generation problem.")
+        st.caption("A ❌ in Right section is a retrieval problem. A ✅ section with a wrong answer is a generation problem.")
+        adv = scores["Advanced"]
+        if adv[0] == adv[1]:
+            pip("happy", f"Perfect score: {adv[0]} of {adv[1]}!", True)
+        elif "Basic" in scores and adv[0] > scores["Basic"][0]:
+            pip("happy", f"The advanced pipeline beat basic RAG, {adv[0]} to {scores['Basic'][0]}.", True)
+        else:
+            pip("confused", f"{adv[0]} of {adv[1]} passed. The Why column shows what to fix.")
