@@ -32,6 +32,16 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # ---------------------------------------------------------------------------
 
 SAMPLE_PATH = Path(__file__).parent / "sample_docs" / "lumen_design_handbook.md"
+SAMPLE_NAME = "lumen_design_handbook.md"
+SAMPLE_TEXT = '# Lumen Design System — Team Handbook\n\nThis handbook explains how the product design team builds, reviews and ships work using the Lumen design system. It is a fictional sample document used to demonstrate the Margin RAG chatbot.\n\n# About Lumen\n\nLumen is the shared design system used by all product squads. It contains foundations (color, type, spacing, motion), a component library in Figma, and matching React components maintained by the front-end platform team. The design system team has four people: one lead designer, two product designers and one design engineer. Lumen releases a new version on the first Monday of every month.\n\n# Color tokens\n\nNever use raw hex values in a design file. Always use a semantic color token such as color.text.primary or color.surface.raised. Brand colors are only used for marketing surfaces and must not appear inside the product UI. Every color token has a light-mode and a dark-mode value, and designers must check both modes before handoff.\n\n# Accessibility standards\n\nAll product screens must meet WCAG 2.2 level AA. Body text needs a contrast ratio of at least 4.5:1 against its background. Large text (24px and above, or 18.5px bold) and UI icons need at least 3:1. Interactive targets must be at least 44 by 44 pixels on touch devices. Every flow must be fully usable with a keyboard, and focus states must always be visible. Color must never be the only way information is shown; pair it with an icon, label or pattern.\n\n# Typography\n\nThe product typeface is Inter for UI text and JetBrains Mono for code. The type scale has seven steps: 12, 14, 16, 20, 24, 32 and 40 pixels. Body text is 16px with a line height of 1.5. Do not use more than three type sizes on a single screen.\n\n# Spacing and layout\n\nLumen uses a 4px base spacing unit. All padding and margins must be multiples of 4px, with the most common values being 8, 16, 24 and 32. Layouts use a 12-column grid on desktop with 24px gutters, an 8-column grid on tablet and a 4-column grid on mobile with 16px gutters. Maximum content width is 1280px.\n\n# Icons\n\nIcons come in three sizes: 16px, 20px and 24px. Use the 20px size by default. All icons are outlined with a 1.5px stroke. Custom icons must be submitted to the design system team for review before they are used in production.\n\n# Design critique\n\nDesign crits happen every Wednesday from 3:00 to 4:00 pm. Anyone can bring work at any fidelity. Book a slot in the #design-crit channel by Tuesday at 6 pm. Each slot is 20 minutes: 5 minutes of context, 10 minutes of feedback and 5 minutes to agree on next steps. Feedback should be framed around the user problem and the brief, not personal taste.\n\n# Requesting a new component\n\nIf no existing component fits, fill in the component request form in Notion. Include the problem, at least two real screens where it will be used, and a link to any research. The design system team reviews requests every Friday. The standard turnaround for a new component, from approval to release in Figma and code, is 10 business days. Urgent requests need sign-off from the head of design.\n\n# Figma file conventions\n\nName files using the pattern Squad / Feature / Stage, for example Payments / Refund flow / Explorations. Every file must have a cover page with the owner, status and last-updated date. Status labels are Exploring, In review, Ready for dev and Shipped. Detach components only as a last resort, and leave a comment explaining why.\n\n# Handoff to engineering\n\nA design is ready for development only when it passes the handoff checklist: all states are designed (empty, loading, error, success), both light and dark modes are checked, copy has been reviewed by the content designer, accessibility annotations are added, and the file status is set to Ready for dev. Designers attend the sprint kickoff for any feature they hand off.\n\n# Deprecating components\n\nWhen a component is replaced, it is marked as deprecated in Figma and code. Deprecated components are kept for two monthly releases and then removed. Squads get a migration guide and a reminder in the #lumen-updates channel one week before removal.\n\n# Research and testing\n\nEvery major feature needs at least five usability test sessions before release. Research notes and recordings are stored in the Research Hub in Dovetail. Participants are paid a 50 dollar voucher for a 45 minute session. Personal data from research must be deleted after 12 months.\n\n# Tools and access\n\nThe team uses Figma for design, Notion for documentation, Dovetail for research and Linear for tracking work. New designers get Figma editor access on their first day and Dovetail access after completing the research privacy training.\n'
+
+
+def load_sample():
+    """Use the file in sample_docs if it exists, otherwise the copy built into this script."""
+    if SAMPLE_PATH.exists():
+        return SAMPLE_PATH.read_bytes()
+    return SAMPLE_TEXT.encode("utf-8")
+
 SAMPLE_LABEL = "Sample: Lumen design handbook"
 UPLOAD_LABEL = "Upload my own files"
 
@@ -95,9 +105,13 @@ st.markdown(
     """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap');
-html, body, [class*="st-"], .stMarkdown, button, input, textarea { font-family: 'Figtree', system-ui, sans-serif; }
-h1, h2, h3, .margin-title { font-family: 'Newsreader', Georgia, serif !important; letter-spacing: -0.01em; }
-.margin-title { font-size: 2.6rem; font-weight: 600; line-height: 1.1; margin: 0; }
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button p {
+  font-family: 'Figtree', system-ui, sans-serif; }
+[data-testid="stIconMaterial"], .material-symbols-rounded {
+  font-family: 'Material Symbols Rounded' !important; }
+.stApp h1, .stApp h2, .stApp h3 { font-family: 'Newsreader', Georgia, serif; letter-spacing: -0.01em; }
+.margin-title { font-family: 'Newsreader', Georgia, serif !important; font-size: 2.6rem !important;
+  font-weight: 600 !important; line-height: 1.1 !important; margin: 0 !important; letter-spacing: -0.01em; }
 .margin-sub { opacity: .72; margin: .35rem 0 1.2rem 0; max-width: 62ch; }
 .margin-source { border-left: 3px solid #4A63D9; padding: .55rem .9rem; margin: .5rem 0 .8rem 0;
                  background: rgba(74, 99, 217, .06); border-radius: 0 6px 6px 0; line-height: 1.55; }
@@ -130,7 +144,7 @@ def password_gate():
     password = read_secret("APP_PASSWORD")
     if not password or st.session_state.get("unlocked"):
         return
-    st.markdown('<p class="margin-title">Margin</p>', unsafe_allow_html=True)
+    st.markdown('<div class="margin-title">Margin</div>', unsafe_allow_html=True)
     entered = st.text_input("Enter the access password to continue", type="password")
     if entered:
         if entered == password:
@@ -477,7 +491,7 @@ settings = {"model": model, "temperature": temperature, "k": k, "mmr": use_mmr}
 # Header + guards
 # ---------------------------------------------------------------------------
 
-st.markdown('<p class="margin-title">Margin</p>', unsafe_allow_html=True)
+st.markdown('<div class="margin-title">Margin</div>', unsafe_allow_html=True)
 st.markdown('<p class="margin-sub">Ask questions about your documents. Every answer points to the '
             'passage it came from, and says so when the answer isn\'t there.</p>', unsafe_allow_html=True)
 
@@ -487,7 +501,7 @@ if not API_KEY:
     st.stop()
 
 if mode == SAMPLE_LABEL:
-    files = ((SAMPLE_PATH.name, SAMPLE_PATH.read_bytes()),)
+    files = ((SAMPLE_NAME, load_sample()),)
 elif uploads:
     files = tuple((f.name, f.getvalue()) for f in uploads)
 else:
