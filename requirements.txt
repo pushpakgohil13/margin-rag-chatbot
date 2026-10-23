@@ -4,6 +4,8 @@ langchain-google-genai
 langchain-text-splitters
 google-genai
 pypdf
+pypdfium2
 python-docx
+rank_bm25
 pandas
 numpy
