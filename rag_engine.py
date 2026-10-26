@@ -27,9 +27,11 @@ from pathlib import Path
 
 import numpy as np
 
-PIPELINE_VERSION = "3.0"
+PIPELINE_VERSION = "4.0"
 APP_DIR = Path(__file__).parent
 CACHE_DIR = Path(tempfile.gettempdir()) / "margin_cache"
+import usage as _usage  # noqa: E402
+USAGE = _usage.Usage(CACHE_DIR / "usage.json")
 NOT_FOUND = "I couldn't find that in your documents."
 
 # ---------------------------------------------------------------------------
@@ -602,7 +604,7 @@ def embedding_model_name(api_key):
         return "models/gemini-embedding-001"
 
 
-def make_embeddings(api_key, model_name):
+def _raw_embeddings(api_key, model_name):
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
     kwargs = {"model": model_name, "google_api_key": api_key}
     if "gemini-embedding" in model_name:
@@ -610,10 +612,83 @@ def make_embeddings(api_key, model_name):
     return GoogleGenerativeAIEmbeddings(**kwargs)
 
 
-def make_llm(api_key, model, temperature=0.2, max_tokens=1200):
+def _raw_llm(api_key, model, temperature, max_tokens):
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(model=model, temperature=temperature, max_output_tokens=max_tokens,
                                   google_api_key=api_key, max_retries=2)
+
+
+def _usage_tokens(message, prompt, text):
+    meta = getattr(message, "usage_metadata", None) or {}
+    inp = meta.get("input_tokens") or len(str(prompt)) // 4
+    out = meta.get("output_tokens") or len(text) // 4
+    return inp, out
+
+
+class TrackedEmbeddings:
+    """Counts every embedding call so the usage meter stays accurate."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def embed_documents(self, texts):
+        try:
+            out = self.inner.embed_documents(texts)
+        except Exception as e:
+            if is_rate_limit(e):
+                USAGE.record_limit_hit("embed")
+            raise
+        USAGE.record_embed(len(texts), sum(len(t) for t in texts))
+        return out
+
+    def embed_query(self, text):
+        try:
+            out = self.inner.embed_query(text)
+        except Exception as e:
+            if is_rate_limit(e):
+                USAGE.record_limit_hit("embed")
+            raise
+        USAGE.record_embed(1, len(text))
+        return out
+
+
+class TrackedLLM:
+    """Counts every chat-model call and its tokens (from Gemini's usage metadata when available)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def invoke(self, prompt):
+        try:
+            reply = self.inner.invoke(prompt)
+        except Exception as e:
+            if is_rate_limit(e):
+                USAGE.record_limit_hit("chat")
+            raise
+        USAGE.record_chat(*_usage_tokens(reply, prompt, get_text(reply)))
+        return reply
+
+    def stream(self, prompt):
+        text, last = "", None
+        try:
+            for chunk in self.inner.stream(prompt):
+                if getattr(chunk, "usage_metadata", None):
+                    last = chunk
+                text += get_text(chunk)
+                yield chunk
+        except Exception as e:
+            if is_rate_limit(e):
+                USAGE.record_limit_hit("chat")
+            raise
+        USAGE.record_chat(*_usage_tokens(last, prompt, text))
+
+
+def make_embeddings(api_key, model_name):
+    return TrackedEmbeddings(_raw_embeddings(api_key, model_name))
+
+
+def make_llm(api_key, model, temperature=0.2, max_tokens=1200):
+    return TrackedLLM(_raw_llm(api_key, model, temperature, max_tokens))
 
 
 def normalise_rows(m):
@@ -635,45 +710,41 @@ def serialise(kb):
     return gzip.compress(pickle.dumps(keep))
 
 
-def build_kb(entries, api_key, chat_model, progress=None):
-    """entries: list of dicts with name, data, profile, title. Each file is handled with its own strategy."""
-    say = progress or (lambda *_: None)
-    embed_model = embedding_model_name(api_key)
-    h = hashlib.sha256(json.dumps([PIPELINE_VERSION, embed_model]).encode())
-    for e in entries:
-        h.update(e["name"].encode() + e["profile"].encode() + hashlib.sha256(e["data"]).digest())
-    key = h.hexdigest()[:20]
+def file_key(entry, embed_model):
+    h = hashlib.sha256(json.dumps([PIPELINE_VERSION, embed_model, entry["name"], entry["profile"]]).encode())
+    h.update(hashlib.sha256(entry["data"]).digest())
+    return h.hexdigest()[:20]
 
+
+def build_file_index(entry, api_key, chat_model, embed_model, progress=None):
+    """Parse, chunk and embed ONE file with its own strategy. Cached by content, name and type."""
+    say = progress or (lambda *_, **__: None)
+    key = file_key(entry, embed_model)
     if key in _MEMORY:
         return _MEMORY[key]
-    cached = CACHE_DIR / f"{key}.pkl.gz"
+    cached = CACHE_DIR / f"file_{key}.pkl.gz"
     if cached.exists():
         try:
-            kb = pickle.loads(gzip.decompress(cached.read_bytes()))
-            kb["bm25"], kb["loaded_from"] = make_bm25(kb["chunks"]), "server cache"
-            _MEMORY[key] = kb
-            return kb
+            idx = pickle.loads(gzip.decompress(cached.read_bytes()))
+            idx["loaded_from"] = "server cache"
+            _MEMORY[key] = idx
+            return idx
         except Exception:
             pass
 
-    timings, chunks = {}, []
+    p, name, timings = PROFILES[entry["profile"]], entry["name"], {}
     t = time.time()
-    for n, e in enumerate(entries, 1):
-        p = PROFILES[e["profile"]]
-        say("parse", f"Reading {e['name']}", 0.02, file=e["name"])
-        part = CHUNKERS[e["profile"]](e["name"], e["title"], e["data"], p["chunk_size"], p["chunk_overlap"])
-        if p["vision"] and e["name"].lower().endswith(".pdf"):
-            vision_llm = make_llm(api_key, chat_model, temperature=0.0, max_tokens=2000)
-            part += describe_pages(e["name"], e["title"], e["data"], vision_llm,
-                                   progress=lambda msg, f: say("vision", msg, 0.05 + 0.25 * f, file=e["name"]))
-        for c in part:
-            c["profile"], c["title"] = e["profile"], e["title"]
-        chunks.extend(part)
+    say("parse", f"Reading {name}", 0.02, file=name)
+    chunks = CHUNKERS[entry["profile"]](name, entry["title"], entry["data"], p["chunk_size"], p["chunk_overlap"])
+    if p["vision"] and name.lower().endswith(".pdf"):
+        vision_llm = make_llm(api_key, chat_model, temperature=0.0, max_tokens=2000)
+        chunks += describe_pages(name, entry["title"], entry["data"], vision_llm,
+                                 progress=lambda msg, f: say("vision", msg, 0.05 + 0.25 * f, file=name))
+    for c in chunks:
+        c["profile"], c["title"] = entry["profile"], entry["title"]
     timings["parse_chunk"] = time.time() - t
     if not chunks:
-        raise ValueError("No readable text was found. Scanned PDFs (photos of pages) aren't supported yet.")
-    for i, c in enumerate(chunks):
-        c["id"] = i
+        raise ValueError(f"No readable text was found in {name}. Scanned PDFs (photos of pages) aren't supported yet.")
 
     t = time.time()
     emb = make_embeddings(api_key, embed_model)
@@ -681,17 +752,40 @@ def build_kb(entries, api_key, chat_model, progress=None):
     vectors, batch = [], 32
     for start in range(0, len(texts), batch):
         frac = 0.3 + 0.7 * start / len(texts)
-        say("embed", f"Turning passages {start + 1}–{min(start + batch, len(texts))} of {len(texts)} into vectors", frac)
+        say("embed", f"Turning passages {start + 1}–{min(start + batch, len(texts))} of {len(texts)} into vectors",
+            frac, file=name)
         part = texts[start:start + batch]
         vectors.extend(call_with_retry(lambda: emb.embed_documents(part),
-                                       wait=lambda s: say("wait", f"Gemini asked me to slow down. Back in {s}s", frac)))
+                                       wait=lambda s: say("wait", f"Gemini asked me to slow down. Back in {s}s",
+                                                          frac, file=name)))
     timings["embed"] = time.time() - t
+    idx = {"key": key, "file": {"name": name, "profile": entry["profile"], "title": entry["title"]},
+           "chunks": chunks, "vectors": normalise_rows(vectors), "timings": timings, "loaded_from": "built just now"}
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(gzip.compress(pickle.dumps(idx)))
+    except Exception:
+        pass
+    _MEMORY[key] = idx
+    return idx
 
-    kb = {"key": key, "title": " + ".join(e["title"] for e in entries), "profiles": sorted({e["profile"] for e in entries}),
-          "chunks": chunks, "vectors": normalise_rows(vectors), "embed_model": embed_model,
-          "files": [{"name": e["name"], "profile": e["profile"], "title": e["title"]} for e in entries],
-          "timings": timings, "loaded_from": "built just now", "suggestions": []}
-    save_kb(kb)
+
+def build_kb(entries, api_key, chat_model, progress=None):
+    """Combine the per-file indexes of a conversation's documents into one searchable knowledge base."""
+    embed_model = embedding_model_name(api_key)
+    parts = [build_file_index(e, api_key, chat_model, embed_model, progress) for e in entries]
+    key = "kb_" + hashlib.sha256("".join(p["key"] for p in parts).encode()).hexdigest()[:20]
+    if key in _MEMORY:
+        return _MEMORY[key]
+    chunks = [{**c} for p in parts for c in p["chunks"]]  # copies, so each file's own index stays untouched
+    for i, c in enumerate(chunks):
+        c["id"] = i
+    kb = {"key": key, "title": " + ".join(p["file"]["title"] for p in parts),
+          "profiles": sorted({p["file"]["profile"] for p in parts}), "chunks": chunks,
+          "vectors": np.vstack([p["vectors"] for p in parts]), "embed_model": embed_model,
+          "files": [p["file"] for p in parts],
+          "timings": {k: sum(p["timings"].get(k, 0) for p in parts) for k in ("parse_chunk", "embed")},
+          "loaded_from": ", ".join(sorted({p["loaded_from"] for p in parts})), "suggestions": []}
     kb["bm25"] = make_bm25(chunks)
     _MEMORY[key] = kb
     return kb
