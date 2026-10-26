@@ -91,12 +91,20 @@ class Usage:
             self._save()
 
     def record_embed(self, texts, chars):
+        """Google counts each embedded passage against the embedding quota, even inside one batch call."""
         with self.lock:
             self._roll()
-            self.state["embed_requests"] += 1
+            self.state["embed_requests"] += int(texts)
             self.state["embed_tokens"] += int(chars / 4)
-            self.minute["embed"].append((time.time(), int(chars / 4)))
+            now = time.time()
+            for _ in range(int(texts)):
+                self.minute["embed"].append((now, int(chars / 4 / max(texts, 1))))
             self._save()
+
+    def embed_left(self, limit):
+        with self.lock:
+            self._roll()
+            return max(0, limit - self.state["embed_requests"])
 
     def record_question(self, chat_requests):
         with self.lock:

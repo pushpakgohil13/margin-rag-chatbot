@@ -171,6 +171,8 @@ LIMITS = {"chat_rpd": limit("GEMINI_DAILY_REQUESTS", usage_mod.DEFAULT_LIMITS["c
           "embed_rpd": limit("GEMINI_EMBED_DAILY_REQUESTS", usage_mod.DEFAULT_LIMITS["embed_rpd"]),
           "embed_rpm": limit("GEMINI_EMBED_REQUESTS_PER_MINUTE", usage_mod.DEFAULT_LIMITS["embed_rpm"])}
 
+rag.EMBED_DAILY_LIMIT = LIMITS["embed_rpd"]
+
 password = read_secret("APP_PASSWORD")
 if password and not st.session_state.get("unlocked"):
     st.markdown(mascot.render("idle", "This Margin is private.", "hero", uid="lock"), unsafe_allow_html=True)
@@ -274,7 +276,7 @@ def usage_card(u):
             f'<div class="big">{left_line}</div>'
             f'<div class="m-meter {tone}"><i style="width:{max(pct, .02) * 100:.0f}%"></i></div>'
             f'<div class="s">Answers: {u["chat_used"]} of {u["chat_limit"]:,} requests<br>'
-            f'Reading: {u["embed_used"]} of {u["embed_limit"]:,} requests<br>'
+            f'Reading: {u["embed_used"]} of {u["embed_limit"]:,} passages<br>'
             f'Refreshes in <b>{usage_mod.human_duration(u["day_reset_s"])}</b> (midnight Pacific)</div></div>')
 
 
@@ -284,7 +286,9 @@ def usage_details(u):
     st.progress(min(u["chat_used"] / max(u["chat_limit"], 1), 1.0),
                 text=f"Answers and reading: {u['chat_used']} of {u['chat_limit']} requests")
     st.progress(min(u["embed_used"] / max(u["embed_limit"], 1), 1.0),
-                text=f"Indexing (embeddings): {u['embed_used']} of {u['embed_limit']} requests")
+                text=f"Reading (embeddings): {u['embed_used']} of {u['embed_limit']} passages")
+    st.caption("Reading uses one request per passage: about 50 for a 12-page report, 230 for 80 pages "
+               "and 600 for 200 pages. Each question uses 1 more.")
     st.caption(f"Tokens today: {u['input_tokens']:,} in · {u['output_tokens']:,} out · "
                f"{u['embed_tokens']:,} embedded (estimated)")
     st.markdown("**This minute** (rolling 60 seconds)")

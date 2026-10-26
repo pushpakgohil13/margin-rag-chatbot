@@ -32,6 +32,7 @@ APP_DIR = Path(__file__).parent
 CACHE_DIR = Path(tempfile.gettempdir()) / "margin_cache"
 import usage as _usage  # noqa: E402
 USAGE = _usage.Usage(CACHE_DIR / "usage.json")
+EMBED_DAILY_LIMIT = _usage.DEFAULT_LIMITS["embed_rpd"]  # the app sets this from its secrets
 NOT_FOUND = "I couldn't find that in your documents."
 
 # ---------------------------------------------------------------------------
@@ -745,6 +746,13 @@ def build_file_index(entry, api_key, chat_model, embed_model, progress=None):
     timings["parse_chunk"] = time.time() - t
     if not chunks:
         raise ValueError(f"No readable text was found in {name}. Scanned PDFs (photos of pages) aren't supported yet.")
+
+    left = USAGE.embed_left(EMBED_DAILY_LIMIT)
+    if len(chunks) > left:
+        raise ValueError(
+            f"{name} needs about {len(chunks)} reading requests, but only {left} are left in today's Gemini "
+            f"allowance. It refreshes in {_usage.human_duration(_usage.seconds_to_midnight_pacific())} "
+            "(midnight Pacific). Try a shorter document, or come back after the refresh.")
 
     t = time.time()
     emb = make_embeddings(api_key, embed_model)
